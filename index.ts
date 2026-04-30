@@ -397,8 +397,7 @@ async function gitlab<T>(
 
   const response = await fetch(url, init);
   if (!response.ok) {
-    const text = await response.text().catch(() => "unknown");
-    throw new Error(`GitLab ${method} ${path} -> ${response.status}: ${text}`);
+    throw new Error(`GitLab ${method} ${path} -> ${response.status}: ${await readErrorMessage(response)}`);
   }
 
   if (response.status === 204) {
@@ -406,6 +405,52 @@ async function gitlab<T>(
   }
 
   return response.json() as Promise<T>;
+}
+
+async function gitlabText(
+  profile: GitLabProfile,
+  method: string,
+  path: string,
+  options: { query?: Record<string, string | number | boolean | undefined> } = {},
+): Promise<string> {
+  const url = new URL(`${buildApiBaseUrl(profile.baseUrl)}${path}`);
+  for (const [key, value] of Object.entries(options.query ?? {})) {
+    if (value === undefined || value === "") continue;
+    url.searchParams.set(key, String(value));
+  }
+
+  const response = await fetch(url, {
+    method,
+    headers: {
+      Accept: "text/plain, */*",
+      "PRIVATE-TOKEN": profile.token,
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`GitLab ${method} ${path} -> ${response.status}: ${await readErrorMessage(response)}`);
+  }
+  return response.text();
+}
+
+async function readErrorMessage(response: Response): Promise<string> {
+  const raw = await response.text().catch(() => "");
+  if (!raw) return "(empty body)";
+  try {
+    const parsed = JSON.parse(raw) as { message?: unknown; error?: unknown; error_description?: unknown };
+    const candidate = parsed.message ?? parsed.error_description ?? parsed.error;
+    if (candidate == null) return truncate(raw, 400);
+    if (typeof candidate === "string") return candidate;
+    if (Array.isArray(candidate)) return candidate.map(String).join("; ");
+    if (typeof candidate === "object") {
+      const entries = Object.entries(candidate as Record<string, unknown>).map(
+        ([key, value]) => `${key}: ${Array.isArray(value) ? value.map(String).join(", ") : String(value)}`,
+      );
+      return entries.join("; ") || truncate(raw, 400);
+    }
+    return String(candidate);
+  } catch {
+    return truncate(raw, 400);
+  }
 }
 
 async function resolveProject(profile: GitLabProfile, input: {
@@ -821,6 +866,39 @@ function formatJobCompact(job: GitLabJob): string {
   return `${job.id} | ${job.stage} | ${job.name} | ${job.status}${duration}${failure}`;
 }
 
+// ── Repository tree/file types ───────────────────────────────────────
+interface GitLabTreeItem {
+  id: string;
+  name: string;
+  type: "tree" | "blob";
+  path: string;
+  mode: string;
+}
+
+interface GitLabRepositoryFile {
+  file_name: string;
+  file_path: string;
+  size: number;
+  encoding: string;
+  content: string;
+  content_sha256: string;
+  ref: string;
+  blob_id: string;
+  commit_id: string;
+  last_commit_id: string;
+}
+
+function formatTreeItem(item: GitLabTreeItem): string {
+  const marker = item.type === "tree" ? "DIR " : "FILE";
+  return `${marker} | ${item.path}`;
+}
+
+function encodeFilePath(filePath: string): string {
+  const trimmed = filePath.replace(/^\/+/, "");
+  if (!trimmed) throw new Error("filePath is required");
+  return encodeURIComponent(trimmed);
+}
+
 // ── create_merge_request ─────────────────────────────────────────────
 server.tool(
   "create_merge_request",
@@ -991,6 +1069,202 @@ server.tool(
       `Status: ${pipeline.status}`,
       `URL: ${pipeline.web_url}`,
     ].join("\n"));
+  },
+);
+
+// ── get_repository_tree ──────────────────────────────────────────────
+server.tool(
+  "get_repository_tree",
+  "List repository tree (files and directories) for a project at a given path/ref.",
+  {
+    ...ProjectSelectorSchema,
+    path: z.string().optional().describe("Path inside the repository (default: root)"),
+    ref: z.string().optional().describe("Branch, tag, or commit SHA (default: project default branch)"),
+    recursive: z.boolean().optional().default(false).describe("Recurse into subdirectories"),
+    page: z.number().int().min(1).optional().default(1).describe("Page number"),
+    perPage: z.number().int().min(1).max(100).optional().default(PAGE_SIZE).describe("Items per page"),
+  },
+  async ({ projectId, projectPath, path, ref, recursive, page, perPage }) => {
+    const profile = await getActiveProfile();
+    const project = await resolveProject(profile, { projectId, projectPath });
+    const items = await gitlab<GitLabTreeItem[]>(profile, "GET", `/projects/${project.id}/repository/tree`, {
+      query: {
+        path,
+        ref,
+        recursive,
+        page,
+        per_page: perPage,
+      },
+    });
+
+    if (!items.length) {
+      return okText(`No tree entries for ${project.path_with_namespace} at ${path || "(root)"} @ ${ref || project.default_branch || "(default)"}.`);
+    }
+
+    const header = `${project.path_with_namespace} tree | path: ${path || "(root)"} | ref: ${ref || project.default_branch || "(default)"} | ${items.length} entries`;
+    const lines = items.map(formatTreeItem);
+    return okText(`${header}\n${lines.join("\n")}`);
+  },
+);
+
+// ── get_repository_file ──────────────────────────────────────────────
+server.tool(
+  "get_repository_file",
+  "Get a file's content from a project's repository at a given path/ref. Returns decoded UTF-8 text.",
+  {
+    ...ProjectSelectorSchema,
+    filePath: z.string().min(1).describe("File path inside the repository, e.g. src/index.ts"),
+    ref: z.string().optional().describe("Branch, tag, or commit SHA (default: project default branch)"),
+    maxBytes: z.number().int().min(1).max(1_000_000).optional().default(200_000).describe("Cap content length in bytes"),
+  },
+  async ({ projectId, projectPath, filePath, ref, maxBytes }) => {
+    const profile = await getActiveProfile();
+    const project = await resolveProject(profile, { projectId, projectPath });
+    const effectiveRef = ref || project.default_branch || "HEAD";
+    const file = await gitlab<GitLabRepositoryFile>(
+      profile,
+      "GET",
+      `/projects/${project.id}/repository/files/${encodeFilePath(filePath)}`,
+      { query: { ref: effectiveRef } },
+    );
+
+    let content = "";
+    let truncated = false;
+    if (file.encoding === "base64") {
+      const decoded = Buffer.from(file.content, "base64");
+      const slice = decoded.subarray(0, maxBytes);
+      truncated = decoded.length > maxBytes;
+      content = slice.toString("utf8");
+    } else {
+      content = file.content ?? "";
+      if (content.length > maxBytes) {
+        content = content.slice(0, maxBytes);
+        truncated = true;
+      }
+    }
+
+    const header = [
+      `File: ${file.file_path}`,
+      `Project: ${project.path_with_namespace}`,
+      `Ref: ${file.ref}`,
+      `Size: ${file.size} bytes`,
+      `Last commit: ${file.last_commit_id}`,
+      `Blob: ${file.blob_id}`,
+      truncated ? `Truncated: yes (showing first ${maxBytes} bytes)` : "Truncated: no",
+      "",
+      "Content:",
+    ].join("\n");
+
+    return okText(`${header}\n${content}`);
+  },
+);
+
+// ── get_job_log ──────────────────────────────────────────────────────
+server.tool(
+  "get_job_log",
+  "Fetch a CI job's trace/log. Returns the tail by default — useful for failed-job debugging.",
+  {
+    ...ProjectSelectorSchema,
+    jobId: z.number().int().min(1).describe("Job ID"),
+    maxBytes: z.number().int().min(1).max(500_000).optional().default(80_000).describe("Cap log size in bytes"),
+    fromStart: z.boolean().optional().default(false).describe("Return head instead of tail when truncating"),
+  },
+  async ({ projectId, projectPath, jobId, maxBytes, fromStart }) => {
+    const profile = await getActiveProfile();
+    const project = await resolveProject(profile, { projectId, projectPath });
+    const trace = await gitlabText(profile, "GET", `/projects/${project.id}/jobs/${jobId}/trace`);
+
+    const totalBytes = Buffer.byteLength(trace, "utf8");
+    const truncated = totalBytes > maxBytes;
+    let body = trace;
+    if (truncated) {
+      const buffer = Buffer.from(trace, "utf8");
+      body = fromStart
+        ? buffer.subarray(0, maxBytes).toString("utf8")
+        : buffer.subarray(buffer.length - maxBytes).toString("utf8");
+    }
+
+    const header = [
+      `Job log: ${jobId}`,
+      `Project: ${project.path_with_namespace}`,
+      `Total size: ${totalBytes} bytes`,
+      truncated
+        ? `Truncated: yes (showing ${fromStart ? "first" : "last"} ${maxBytes} bytes)`
+        : "Truncated: no",
+      "",
+      "Log:",
+    ].join("\n");
+
+    return okText(`${header}\n${body}`);
+  },
+);
+
+// ── Merge request diff types ─────────────────────────────────────────
+interface GitLabMrDiffEntry {
+  old_path: string;
+  new_path: string;
+  a_mode?: string;
+  b_mode?: string;
+  new_file: boolean;
+  renamed_file: boolean;
+  deleted_file: boolean;
+  diff: string;
+}
+
+function formatMrDiffEntry(entry: GitLabMrDiffEntry, maxDiffBytes: number): string {
+  let badge = "modified";
+  if (entry.new_file) badge = "added";
+  else if (entry.deleted_file) badge = "deleted";
+  else if (entry.renamed_file) badge = "renamed";
+
+  const pathLine =
+    entry.renamed_file && entry.old_path !== entry.new_path
+      ? `${entry.old_path} -> ${entry.new_path}`
+      : entry.new_path || entry.old_path;
+
+  const diffBytes = Buffer.byteLength(entry.diff || "", "utf8");
+  const truncated = diffBytes > maxDiffBytes;
+  const diffBody = truncated
+    ? `${Buffer.from(entry.diff || "", "utf8").subarray(0, maxDiffBytes).toString("utf8")}\n... (file diff truncated, ${diffBytes} bytes total)`
+    : entry.diff || "(no diff)";
+
+  return [`--- ${badge} | ${pathLine}`, diffBody].join("\n");
+}
+
+server.tool(
+  "get_merge_request_diff",
+  "Get per-file diffs for a merge request. Truncates each file's diff to keep response small.",
+  {
+    ...ProjectSelectorSchema,
+    mergeRequestIid: z.number().int().min(1).describe("Merge request IID within the project"),
+    page: z.number().int().min(1).optional().default(1).describe("Page number"),
+    perPage: z.number().int().min(1).max(50).optional().default(20).describe("Files per page"),
+    maxDiffBytes: z.number().int().min(500).max(100_000).optional().default(8_000).describe("Cap each file's diff size in bytes"),
+    pathFilter: z.string().optional().describe("Only show files whose new path includes this substring"),
+  },
+  async ({ projectId, projectPath, mergeRequestIid, page, perPage, maxDiffBytes, pathFilter }) => {
+    const profile = await getActiveProfile();
+    const project = await resolveProject(profile, { projectId, projectPath });
+    const diffs = await gitlab<GitLabMrDiffEntry[]>(
+      profile,
+      "GET",
+      `/projects/${project.id}/merge_requests/${mergeRequestIid}/diffs`,
+      { query: { page, per_page: perPage } },
+    );
+
+    const filtered = pathFilter
+      ? diffs.filter((entry) => (entry.new_path || entry.old_path).includes(pathFilter))
+      : diffs;
+
+    if (!filtered.length) {
+      return okText(
+        `No diff entries for !${mergeRequestIid} in ${project.path_with_namespace}${pathFilter ? ` matching "${pathFilter}"` : ""}.`,
+      );
+    }
+
+    const header = `${project.path_with_namespace} !${mergeRequestIid} diff | page ${page} | ${filtered.length} file(s)${pathFilter ? ` | filter: ${pathFilter}` : ""}`;
+    const body = filtered.map((entry) => formatMrDiffEntry(entry, maxDiffBytes)).join("\n\n");
+    return okText(`${header}\n\n${body}`);
   },
 );
 
